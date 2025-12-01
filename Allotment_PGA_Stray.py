@@ -2,7 +2,8 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 
-st.title("🎓 Admission Allotment System – ARank + Category Rules")
+st.title("🎓 Admission Allotment System – ARank + Seat Category Priority")
+
 
 # ----------------------------------------------------
 # UNIVERSAL FILE READER
@@ -28,7 +29,7 @@ def read_any(file):
 
 
 # ----------------------------------------------------
-# CATEGORY ELIGIBILITY RULE
+# CATEGORY ELIGIBILITY LOGIC
 # ----------------------------------------------------
 def category_eligible(seat_cat, cand_cat):
     seat_cat = str(seat_cat).strip().upper()
@@ -39,15 +40,15 @@ def category_eligible(seat_cat, cand_cat):
         return True
 
     # Candidate NA / NULL → NOT eligible for community seats
-    if cand_cat in ["NA", "NULL", "", None]:
+    if cand_cat in ["NA", "NULL", "", None, "N/A"]:
         return False
 
-    # Community seat → must match candidate category
+    # Candidate must match community seat
     return seat_cat == cand_cat
 
 
 # ----------------------------------------------------
-# UPLOAD FILES
+# FILE UPLOADS
 # ----------------------------------------------------
 cand_file = st.file_uploader("1️⃣ Candidates File (ARank, Category, AIQ)", type=["csv", "xlsx"])
 seat_file = st.file_uploader("2️⃣ Seat Matrix (grp, typ, college, course, category, SEAT)", type=["csv", "xlsx"])
@@ -55,18 +56,19 @@ opt_file  = st.file_uploader("3️⃣ Option Entry File", type=["csv", "xlsx"])
 
 if cand_file and seat_file and opt_file:
 
-    # LOAD FILES
+    # LOAD INPUT FILES
     cand = read_any(cand_file)
     seats = read_any(seat_file)
     opts = read_any(opt_file)
 
-    st.success("Files loaded successfully! Processing...")
+    st.success("Files loaded successfully! Running allotment...")
+
 
     # ----------------------------------------------------
     # CLEAN SEAT MATRIX
     # ----------------------------------------------------
-    required_seat_cols = ["grp","typ","college","course","category","SEAT"]
-    for col in required_seat_cols:
+    required_cols = ["grp","typ","college","course","category","SEAT"]
+    for col in required_cols:
         if col not in seats.columns:
             st.error(f"Seat file missing column: {col}")
             st.stop()
@@ -76,14 +78,15 @@ if cand_file and seat_file and opt_file:
 
     seats["SEAT"] = pd.to_numeric(seats["SEAT"], errors="coerce").fillna(0).astype(int)
 
-    # Build seat map with category included
+    # Build seat_map
     seat_map = {}
     for _, r in seats.iterrows():
         key = (r["grp"], r["typ"], r["college"], r["course"], r["category"])
         seat_map[key] = seat_map.get(key, 0) + r["SEAT"]
 
+
     # ----------------------------------------------------
-    # CLEAN OPTIONS
+    # CLEAN OPTION ENTRY
     # ----------------------------------------------------
     opts["ValidOption"] = opts["ValidOption"].astype(str).str.upper().str.strip()
     opts["Delflg"] = opts["Delflg"].astype(str).str.upper().str.strip()
@@ -93,20 +96,20 @@ if cand_file and seat_file and opt_file:
                 (opts["ValidOption"] == "Y") &
                 (opts["Delflg"] != "Y")].copy()
 
-    opts = opts.sort_values(["RollNo","OPNO"])
+    opts = opts.sort_values(["RollNo", "OPNO"])
     opts["RollNo"] = pd.to_numeric(opts["RollNo"], errors="coerce").astype("Int64")
 
+
     # ----------------------------------------------------
-    # CLEAN CANDIDATES
+    # CLEAN CANDIDATE FILE
     # ----------------------------------------------------
     if "ARank" not in cand.columns:
-        st.error("Candidate file missing ARank")
+        st.error("Candidate file missing ARank column.")
         st.stop()
 
     cand["ARank"] = pd.to_numeric(cand["ARank"], errors="coerce").fillna(9999999)
     cand["RollNo"] = pd.to_numeric(cand["RollNo"], errors="coerce").astype("Int64")
 
-    # Ensure essential columns exist
     if "Category" not in cand.columns:
         cand["Category"] = ""
 
@@ -115,8 +118,9 @@ if cand_file and seat_file and opt_file:
 
     cand_sorted = cand.sort_values("ARank")
 
+
     # ----------------------------------------------------
-    # OPTN DECODER (MGADMCGG → M, G, AD, MCG)
+    # OPTION DECODER
     # ----------------------------------------------------
     def decode_opt(opt):
         opt = opt.strip().upper()
@@ -139,15 +143,15 @@ if cand_file and seat_file and opt_file:
         arank = int(c["ARank"])
         ccat = str(c["Category"]).strip().upper()
 
-        # AIQ = Y → NOT eligible
-        if str(c.get("AIQ","")).strip().upper() == "Y":
+        # AIQ = Y → skip
+        if str(c.get("AIQ", "")).strip().upper() == "Y":
             continue
 
         c_opts = opts[opts["RollNo"] == roll]
         if c_opts.empty:
             continue
 
-        # Try each option in order
+        # Try options in ranked order
         for _, op in c_opts.iterrows():
             decoded = decode_opt(op["Optn"])
             if not decoded:
@@ -155,7 +159,7 @@ if cand_file and seat_file and opt_file:
 
             og, otyp, ocourse, oclg = decoded
 
-            # Seat rows matching grp,typ,college,course
+            # All matching seats (grp,typ,college,course)
             seat_rows = seats[
                 (seats["grp"] == og) &
                 (seats["typ"] == otyp) &
@@ -169,24 +173,37 @@ if cand_file and seat_file and opt_file:
             chosen_key = None
             chosen_cat = None
 
-            # Check each seat category row (AM/SM/VK/MU/EZ/BX etc.)
-            for _, sr in seat_rows.iterrows():
-                seat_cat = sr["category"]
-                key = (sr["grp"], sr["typ"], sr["college"], sr["course"], sr["category"])
+            # PRIORITY ORDER: AM → SM → Community seats
+            priority_order = ["AM", "SM"]
+            community_cats = sorted(
+                set(seat_rows["category"]) - {"AM", "SM"}
+            )
+            priority_order += community_cats
 
-                # Seat must have available count
-                if seat_map.get(key, 0) <= 0:
-                    continue
+            # Check in priority order
+            for cat in priority_order:
+                for _, sr in seat_rows[seat_rows["category"] == cat].iterrows():
 
-                # CATEGORY RULE
-                if category_eligible(seat_cat, ccat):
-                    chosen_key = key
-                    chosen_cat = seat_cat
+                    key = (sr["grp"], sr["typ"], sr["college"], sr["course"], sr["category"])
+                    seat_cat = sr["category"]
+
+                    # Available?
+                    if seat_map.get(key, 0) <= 0:
+                        continue
+
+                    # Check category eligibility
+                    if category_eligible(seat_cat, ccat):
+                        chosen_key = key
+                        chosen_cat = seat_cat
+                        break
+
+                if chosen_key:
                     break
 
-            # Seat found!
+            # Found suitable seat
             if chosen_key:
                 seat_map[chosen_key] -= 1
+
                 allotments.append({
                     "RollNo": roll,
                     "ARank": arank,
@@ -195,22 +212,22 @@ if cand_file and seat_file and opt_file:
                     "typ": otyp,
                     "College": oclg,
                     "Course": ocourse,
-                    "SeatCategory": chosen_cat
+                    "SeatCategoryAllotted": chosen_cat
                 })
                 break
 
 
     # ----------------------------------------------------
-    # OUTPUT RESULTS
+    # OUTPUT RESULT
     # ----------------------------------------------------
     result_df = pd.DataFrame(allotments)
 
     st.subheader("🟩 Allotment Result")
-    st.write(f"Total Allotted: **{len(result_df)}**")
+    st.write(f"✅ Total Allotted: **{len(result_df)}**")
 
     st.dataframe(result_df)
 
-    # Download
+    # Download CSV
     buf = BytesIO()
     result_df.to_csv(buf, index=False)
     buf.seek(0)
